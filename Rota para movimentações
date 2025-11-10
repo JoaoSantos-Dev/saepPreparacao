@@ -1,0 +1,114 @@
+// Rotas para Movimentações - GET (LISTAR)
+app.get('/api/movimentacoes', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT m.*, f.nome as ferramenta_nome, f.codigo as ferramenta_codigo 
+       FROM movimentacoes m 
+       LEFT JOIN ferramentas f ON m.ferramenta_id = f.id 
+       ORDER BY m.created_at DESC`
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Erro ao listar movimentações:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Rotas para Movimentações - POST (CRIAR) - JÁ EXISTE NO SEU CÓDIGO
+app.post('/api/movimentacoes', requireAuth, async (req, res) => {
+  let client;
+  try {
+    const { ferramenta_id, tipo_movimentacao, quantidade, valor_unitario, cliente_fornecedor, observacao, usuario_id } = req.body;
+    
+    if (!ferramenta_id || !tipo_movimentacao || !quantidade) {
+      return res.status(400).json({ error: 'Ferramenta, tipo e quantidade são obrigatórios' });
+    }
+
+    console.log('📥 Recebendo movimentação:', { ferramenta_id, tipo_movimentacao, quantidade });
+
+    // ✅ INICIAR TRANSACTION para garantir consistência
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    // Buscar informações da ferramenta
+    const ferramentaResult = await client.query(
+      'SELECT quantidade, estoque_minimo FROM ferramentas WHERE id = $1',
+      [ferramenta_id]
+    );
+
+    if (ferramentaResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ferramenta não encontrada' });
+    }
+
+    const quantidadeAtual = ferramentaResult.rows[0].quantidade;
+    const estoqueMinimo = ferramentaResult.rows[0].estoque_minimo || 1;
+    const quantidadeMov = parseInt(quantidade);
+
+    console.log('📊 Estoque atual:', quantidadeAtual, 'Quantidade mov:', quantidadeMov);
+
+    // Calcular novo estoque
+    let novoEstoque;
+    if (tipo_movimentacao === 'entrada') {
+      novoEstoque = quantidadeAtual + quantidadeMov;
+    } else {
+      novoEstoque = quantidadeAtual - quantidadeMov;
+      
+      // Validar estoque
+      if (novoEstoque < 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ 
+          error: 'Estoque insuficiente para esta venda.',
+          estoqueAtual: quantidadeAtual,
+          quantidadeSolicitada: quantidadeMov
+        });
+      }
+    }
+
+    // ✅ ATUALIZAR ESTOQUE DA FERRAMENTA
+    console.log('🔄 Atualizando estoque para:', novoEstoque);
+    await client.query(
+      'UPDATE ferramentas SET quantidade = $1 WHERE id = $2',
+      [novoEstoque, ferramenta_id]
+    );
+
+    // ✅ CRIAR MOVIMENTAÇÃO
+    const movimentacaoResult = await client.query(
+      'INSERT INTO movimentacoes (ferramenta_id, tipo_movimentacao, quantidade, valor_unitario, cliente_fornecedor, observacao, usuario_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      [ferramenta_id, tipo_movimentacao, quantidadeMov, valor_unitario || null, cliente_fornecedor || null, observacao || null, usuario_id || null]
+    );
+
+    // ✅ COMMIT DA TRANSACTION
+    await client.query('COMMIT');
+
+    // Verificar se ficará abaixo do estoque mínimo (apenas para alerta)
+    let alerta = null;
+    if (tipo_movimentacao === 'saida' && novoEstoque < estoqueMinimo) {
+      alerta = `ALERTA: Após esta movimentação, o estoque (${novoEstoque}) ficará abaixo do mínimo (${estoqueMinimo}).`;
+    }
+
+    console.log('✅ Movimentação criada com sucesso. Novo estoque:', novoEstoque);
+
+    res.status(201).json({ 
+      id: movimentacaoResult.rows[0].id,
+      alerta: alerta,
+      estoqueAtual: novoEstoque,
+      estoqueMinimo: estoqueMinimo,
+      message: 'Movimentação registrada com sucesso'
+    });
+
+  } catch (error) {
+    // ✅ ROLLBACK em caso de erro
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('❌ Erro ao criar movimentação:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    // ✅ LIBERAR CONEXÃO
+    if (client) {
+      client.release();
+    }
+  }
+});
